@@ -68,3 +68,5 @@ server.log
 /examples/
 /tests/
 /prisma/
+/upload/
+/download/
