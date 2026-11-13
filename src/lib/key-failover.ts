@@ -155,7 +155,11 @@ export async function runWithFailover(ctx: ProviderCallContext): Promise<Failove
     };
   }
 
-  let lastNonPermanent = false;
+  let sawTemporary = false;
+  let sawExhausted = false;
+  let sawDisabled = false;
+  let sawProvider = false;
+  let lastErrorMessage = "";
 
   for (const key of pool) {
     try {
@@ -170,19 +174,23 @@ export async function runWithFailover(ctx: ProviderCallContext): Promise<Failove
       const err = e as { status?: number; message?: string };
       const status = err?.status ?? 0;
       const message = err?.message ?? String(e);
+      lastErrorMessage = message;
       const cls = classifyProviderError(status, message);
       attempts.push({ keyId: key.id, provider: key.provider, errorClass: cls, error: message });
 
       if (cls === "disabled") {
+        sawDisabled = true;
         await markKeyStatus(key.id, "disabled", message);
       } else if (cls === "exhausted") {
+        sawExhausted = true;
         await markKeyStatus(key.id, "exhausted", message);
         await markKeyUsed(key.id, false);
       } else if (cls === "provider") {
+        sawProvider = true;
         await markKeyUsed(key.id, false);
       } else if (cls === "temporary") {
+        sawTemporary = true;
         await markKeyUsed(key.id, false);
-        lastNonPermanent = true;
       } else if (cls === "params") {
         // Client request error: stop immediately.
         return {
@@ -195,12 +203,53 @@ export async function runWithFailover(ctx: ProviderCallContext): Promise<Failove
     }
   }
 
+  // Classify the overall failure so callers (tasks.ts) can decide whether
+  // to mark the task as "failed" immediately or keep it "processing-awaiting-key".
+  //
+  // - exhausted (Credits insufficient): NEVER wait — top up required manually.
+  //   Mark task as FAILED so the user knows they need to top up.
+  // - disabled (401/403): NEVER wait — key is invalid, won't recover on its own.
+  //   Mark task as FAILED.
+  // - provider (model not found): NEVER wait — config error, won't recover.
+  //   Mark task as FAILED.
+  // - temporary (5xx, 429, network): MAYBE wait — could recover on next poll.
+  //   Keep task as "processing-awaiting-key".
+  if (sawExhausted && !sawTemporary) {
+    return {
+      success: false,
+      errorClass: "exhausted",
+      errorMessage: lastErrorMessage || "All API keys are out of credits (exhausted). Please top up your kie.ai balance.",
+      attempts,
+      awaitingKey: false,
+    };
+  }
+  if (sawDisabled && !sawTemporary && !sawExhausted) {
+    return {
+      success: false,
+      errorClass: "disabled",
+      errorMessage: lastErrorMessage || "All API keys are disabled or invalid. Check your API keys in the dashboard.",
+      attempts,
+      awaitingKey: false,
+    };
+  }
+  if (sawProvider && !sawTemporary && !sawExhausted && !sawDisabled) {
+    return {
+      success: false,
+      errorClass: "provider",
+      errorMessage: lastErrorMessage || "All API keys rejected the model. Check that the model id is supported.",
+      attempts,
+      awaitingKey: false,
+    };
+  }
+
+  // Mixed or only temporary errors — keep "processing-awaiting-key" so the
+  // task can be retried when a key becomes available / a transient error clears.
   return {
     success: false,
     errorClass: "temporary",
     errorMessage: "All keys failed with non-permanent errors; task will be retried.",
     attempts,
-    awaitingKey: lastNonPermanent || true,
+    awaitingKey: true,
   };
 }
 

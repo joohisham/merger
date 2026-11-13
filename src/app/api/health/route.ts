@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { pingTurso, ensureSchema, getSchemaDebug } from "@/lib/turso";
 import { pingMerger } from "@/lib/merger";
 import { listApiKeys } from "@/lib/key-failover";
+import { sweepProcessingTasks } from "@/lib/tasks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,6 +15,10 @@ export const dynamic = "force-dynamic";
  * it returns a 200 with `ok: false` and diagnostic info so the dashboard
  * can show what's wrong instead of a fetch error.
  *
+ * Also triggers sweepProcessingTasks() so stale "processing" tasks (>3 min
+ * with no progress) get marked as "failed" — this is the user-facing way
+ * the dashboard refresh causes the timeout reaper to fire on Vercel.
+ *
  * Returns:
  *  {
  *    ok: boolean,
@@ -21,10 +26,8 @@ export const dynamic = "force-dynamic";
  *    merger: boolean,
  *    keys: number,
  *    auth: boolean,
- *    tursoUrlSet: boolean,   // whether TURSO_DATABASE_URL env var is set
- *    tursoTokenSet: boolean, // whether TURSO_AUTH_TOKEN env var is set
- *    kieKeySet: boolean,     // whether KIE_API_KEY env var is set
- *    error: string | null,   // last error message (truncated)
+ *    env: { tursoUrlSet, tursoTokenSet, kieKeySet, sitePasswordSet },
+ *    error: string | null,
  *    timestamp: string
  *  }
  */
@@ -44,6 +47,16 @@ export async function GET() {
   } catch (e) {
     error = (e as Error).message?.slice(0, 300) || "ensureSchema() failed";
     // Continue — we still want to report what we can.
+  }
+
+  // Sweep stale "processing" tasks (>3 min no progress) → mark as "failed".
+  // This is the user-facing way the dashboard refresh triggers the timeout
+  // reaper on Vercel serverless (where fire-and-forget doesn't work).
+  // Best-effort — never throw.
+  try {
+    await sweepProcessingTasks(5);
+  } catch (e) {
+    console.error("[health] sweepProcessingTasks error:", e);
   }
 
   // Ping Turso (also wrapped in try/catch internally, returns bool).

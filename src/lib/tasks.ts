@@ -74,6 +74,17 @@ export async function getTask(id: string): Promise<TaskRow | null> {
 
 export async function listTasks(limit = 50, type?: TaskType): Promise<TaskRow[]> {
   await ensureSchema();
+  // Sweep "processing" tasks BEFORE returning the list. We AWAIT (not fire-and-
+  // forget) because Vercel serverless kills the lambda as soon as the response
+  // is sent — a fire-and-forget sweep would be cut off and never complete.
+  // Sweeping stale tasks is fast (no HTTP calls — just marks them failed).
+  // Non-stale processing tasks get polled, but bounded to maxToProcess.
+  try {
+    await sweepProcessingTasks(5);
+  } catch (e) {
+    console.error("[tasks] sweepProcessingTasks error:", e);
+  }
+
   if (type) {
     const r = await db.execute({
       sql: `SELECT * FROM tasks WHERE type = ? ORDER BY created_at DESC LIMIT ?`,
@@ -194,8 +205,20 @@ export async function createImageTask(p: ImageGenParams): Promise<{ taskId: stri
       error_message: outcome.errorMessage,
       completed_at: new Date().toISOString(),
     });
+  } else if (!outcome.awaitingKey) {
+    // Permanent failure (exhausted / disabled / provider / unknown):
+    // mark FAILED immediately so the user knows they need to top up credits
+    // or fix their API key — there's no point waiting.
+    await updateTask(id, {
+      attempts_json: JSON.stringify(outcome.attempts),
+      status: "failed",
+      progress: 0,
+      error_message: outcome.errorMessage,
+      completed_at: new Date().toISOString(),
+    });
   } else {
-    // Awaiting a valid key: stay "processing" and let get_task retry.
+    // awaitingKey === true: transient (5xx/429/network) errors only — keep
+    // "processing" so get_task can retry when a key becomes available.
     await updateTask(id, {
       attempts_json: JSON.stringify(outcome.attempts),
       status: "processing",
@@ -270,6 +293,15 @@ export async function createVideoTask(p: VideoGenParams): Promise<{ taskId: stri
       error_message: outcome.errorMessage,
       completed_at: new Date().toISOString(),
     });
+  } else if (!outcome.awaitingKey) {
+    // Permanent failure (exhausted / disabled / provider): mark FAILED immediately.
+    await updateTask(id, {
+      attempts_json: JSON.stringify(outcome.attempts),
+      status: "failed",
+      progress: 0,
+      error_message: outcome.errorMessage,
+      completed_at: new Date().toISOString(),
+    });
   } else {
     await updateTask(id, {
       attempts_json: JSON.stringify(outcome.attempts),
@@ -308,12 +340,38 @@ export async function createMergeTaskEntry(clips: MergeClip[], socialPlatform = 
 
 /* ----------------------------- Polling ------------------------------------ */
 
+/** Max age (in ms) a "processing" task can stay without progress before being marked failed. */
+export const STALE_TASK_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+
 /**
  * Advance a task by polling the provider / merger. Called by get_task.
  * Returns the fresh task state.
+ *
+ * IMPORTANT: this function never silently swallows errors. If polling fails:
+ *  - On auth/key errors (401/403) we mark the task as "failed" — the key
+ *    that submitted the task is no longer valid, so polling will never succeed.
+ *  - On other errors (transient network, 5xx), we record the error but keep
+ *    the task "processing" so it can be retried later.
+ *  - After STALE_TASK_TIMEOUT_MS (3 min) with no progress change, we mark
+ *    the task as "failed" to prevent it from sitting in "processing" forever.
  */
 export async function advanceTask(task: TaskRow): Promise<TaskRow> {
   if (task.status === "completed" || task.status === "failed") return task;
+
+  // Stale-task reaper: if updated_at is older than the timeout, mark failed.
+  // This catches tasks that are stuck waiting for a key, or tasks whose
+  // provider polling always fails silently.
+  const stale = isStale(task);
+  if (stale) {
+    await updateTask(task.id, {
+      status: "failed",
+      error_message: task.error_message
+        ? `${task.error_message} (timed out: no progress for >3 minutes)`
+        : "Task timed out: no progress for >3 minutes. Likely the API key is exhausted/disabled, or the provider task is no longer pollable.",
+      completed_at: new Date().toISOString(),
+    });
+    return (await getTask(task.id))!;
+  }
 
   if (task.type === "merge" && task.provider_task_id) {
     try {
@@ -338,50 +396,161 @@ export async function advanceTask(task: TaskRow): Promise<TaskRow> {
 
   if ((task.type === "image" || task.type === "video") && task.provider_task_id && task.provider) {
     // Async provider task — poll for completion.
+    let polled: { status: string; progress: number; urls: string[]; raw: unknown };
     try {
       const { getKeyPool } = await import("./key-failover");
       const pool = await getKeyPool([task.provider as ProviderName]);
+      // Prefer the original key that submitted the task.
       const key = pool.find((k) => k.id === task.key_id) || pool[0];
       if (!key) {
-        // Original key gone; try any key from the same provider.
-        if (pool.length === 0) return task;
-        const polled = await kiePollTask(pool[0], task.provider_task_id, task.type);
+        // No keys at all — keep the task processing; the stale reaper above
+        // will eventually mark it failed if it never progresses.
         await updateTask(task.id, {
-          progress: polled.progress,
-          status: polled.status === "completed" ? "completed" : polled.status === "failed" ? "failed" : "processing",
-          result_urls_json: polled.urls.length ? JSON.stringify(polled.urls) : task.result_urls_json,
-          completed_at: polled.status === "completed" ? new Date().toISOString() : null,
+          error_message: "No API keys available for the task's provider.",
         });
         return (await getTask(task.id))!;
       }
-      const polled = await kiePollTask(key, task.provider_task_id, task.type);
-      await updateTask(task.id, {
-        progress: polled.progress,
-        status: polled.status === "completed" ? "completed" : polled.status === "failed" ? "failed" : "processing",
-        result_urls_json: polled.urls.length ? JSON.stringify(polled.urls) : task.result_urls_json,
-        completed_at: polled.status === "completed" ? new Date().toISOString() : null,
-      });
+      polled = await kiePollTask(key, task.provider_task_id, task.type);
+      // Treat auth errors during polling as fatal: the key that submitted
+      // the task is no longer valid, so we'll never get results.
+      // We detect this by checking the raw response code in the thrown error.
     } catch (e: unknown) {
-      await updateTask(task.id, { error_message: (e as Error).message });
+      const err = e as { status?: number; message?: string };
+      const status = err.status ?? 0;
+      const msg = err.message || String(e);
+
+      // 401/403 = key invalid/disabled → can never poll this task again
+      // 422 = task id unknown to kie.ai → can never get results
+      // These are permanent — mark the task failed so it doesn't sit forever.
+      if (status === 401 || status === 403 || status === 422) {
+        await updateTask(task.id, {
+          status: "failed",
+          error_message: `Provider polling failed permanently (HTTP ${status}): ${msg}`,
+          completed_at: new Date().toISOString(),
+        });
+        return (await getTask(task.id))!;
+      }
+
+      // Transient errors: record but keep "processing" — reaper will catch
+      // it if it stays stuck for >3 minutes.
+      await updateTask(task.id, { error_message: `Polling error: ${msg}` });
+      return (await getTask(task.id))!;
     }
+
+    // Polled successfully — update progress + status.
+    const newProgress = Math.max(task.progress, polled.progress);
+    const fields: Record<string, unknown> = {
+      progress: newProgress,
+      // Clear transient polling errors when we get a successful poll.
+      error_message: polled.status === "failed" ? "Provider reported task failure." : null,
+    };
+    if (polled.status === "completed" && polled.urls.length > 0) {
+      fields.status = "completed";
+      fields.progress = 100;
+      fields.result_urls_json = JSON.stringify(polled.urls);
+      fields.completed_at = new Date().toISOString();
+    } else if (polled.status === "completed" && polled.urls.length === 0) {
+      // kie.ai said "completed" but returned no URLs — treat as failed.
+      fields.status = "failed";
+      fields.error_message = "Provider marked the task completed but returned no result URLs.";
+      fields.completed_at = new Date().toISOString();
+    } else if (polled.status === "failed") {
+      fields.status = "failed";
+      fields.error_message = "Provider reported task failure.";
+      fields.completed_at = new Date().toISOString();
+    } else {
+      fields.status = "processing";
+    }
+    await updateTask(task.id, fields);
     return (await getTask(task.id))!;
   }
 
-  // Image tasks without provider_task_id may have completed synchronously.
+  // Image tasks without provider_task_id never reached kie.ai. If they have
+  // no key_id, attempt a fresh failover on every poll (e.g. a key was added
+  // after the task was created). The stale reaper above will eventually
+  // fail them if the failover keeps returning awaitingKey.
   if (task.type === "image" && !task.provider_task_id && task.status === "processing") {
-    // If no key was available, attempt a fresh failover on every poll.
     if (!task.key_id) {
-      await createImageTask({
-        prompt: task.prompt,
-        model: task.model,
-        social_platform: task.social_platform,
-        ...JSON.parse(task.params_json || "{}"),
-      }).catch(() => {});
+      try {
+        const params = JSON.parse(task.params_json || "{}");
+        await createImageTask({
+          prompt: task.prompt,
+          model: task.model,
+          social_platform: task.social_platform,
+          aspect_ratio: params.aspect_ratio,
+          width: params.width,
+          height: params.height,
+          n: params.n,
+        });
+      } catch {
+        // createImageTask already wrote its own error; nothing to do.
+      }
+      return (await getTask(task.id))!;
+    }
+  }
+
+  // Same retry path for video tasks awaiting a key.
+  if (task.type === "video" && !task.provider_task_id && task.status === "processing") {
+    if (!task.key_id) {
+      try {
+        const params = JSON.parse(task.params_json || "{}");
+        await createVideoTask({
+          prompt: task.prompt,
+          model: task.model,
+          social_platform: task.social_platform,
+          aspect_ratio: params.aspect_ratio,
+          duration: params.duration,
+        });
+      } catch {
+        // already recorded
+      }
       return (await getTask(task.id))!;
     }
   }
 
   return task;
+}
+
+/** Detect if a processing task is stale (no progress update within timeout). */
+function isStale(task: TaskRow): boolean {
+  if (task.status !== "processing") return false;
+  // Use updated_at; if it's missing fall back to created_at.
+  const ts = task.updated_at || task.created_at;
+  if (!ts) return false;
+  // Accept both ISO ("2026-11-13T...") and SQLite ("2026-11-13 12:34:56") formats.
+  const iso = ts.includes("T") ? ts : ts.replace(" ", "T") + "Z";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return false;
+  return Date.now() - t > STALE_TASK_TIMEOUT_MS;
+}
+
+/**
+ * Sweep all "processing" tasks, advancing each. Called by listTasks() and
+ * the /api/tasks list endpoint so tasks progress even when nobody polls
+ * a specific task. Bounded by concurrency to avoid hammering kie.ai.
+ *
+ * Returns the count of tasks that transitioned out of "processing".
+ */
+export async function sweepProcessingTasks(maxToProcess = 10): Promise<number> {
+  const r = await db.execute({
+    sql: `SELECT * FROM tasks WHERE status = 'processing'
+          ORDER BY updated_at ASC LIMIT ?`,
+    args: [maxToProcess],
+  });
+  const tasks = r.rows.map(rowToTask);
+  let changed = 0;
+  for (const t of tasks) {
+    const before = t.status;
+    try {
+      await advanceTask(t);
+    } catch {
+      // advanceTask should not throw; defensive guard.
+    }
+    // Re-read to see if status changed
+    const after = await getTask(t.id);
+    if (after && after.status !== before) changed++;
+  }
+  return changed;
 }
 
 /* ----------------------------- List media --------------------------------- */

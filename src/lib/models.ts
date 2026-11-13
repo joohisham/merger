@@ -1,8 +1,16 @@
 /**
  * Supported generation models, normalized names + aliases.
  *
- * Image: gpt-image-2-6/flare-text-to-image
- * Video: grok-imagine-video-1-5-preview
+ * Default image model: gpt-image-2-6/economy-text-to-image (5 credits/image ≈ $0.025)
+ *   - Same GPT Image 2.6 family as the "flare" variant but per-image pricing
+ *     instead of per-token, making it 6-7x cheaper for typical social media work.
+ *   - With 80 credits you can generate ~16 images. The "flare" model costs
+ *     ~30-36 credits per image (token-based) so it doesn't fit small budgets.
+ *
+ * Premium image model: gpt-image-2-6/flare-text-to-image (token-based, ~$0.025-0.035/image)
+ *   - Available via explicit `model` parameter; better quality + supports edits.
+ *
+ * Video: grok-imagine-video-1-5-preview (2.4 credits/second ≈ $0.012)
  *
  * Aliases are accepted at the API/MCP boundary and normalized before use.
  */
@@ -15,22 +23,54 @@ export interface ModelSpec {
   aliases: string[];          // accepted alternative spellings
   provider: "kie" | "cometapi";
   description: string;
+  creditsPerUnit: string;     // human-readable cost (e.g. "5 credits/image")
+  isDefault?: boolean;        // marks the default model for its kind
 }
 
 export const MODELS: ModelSpec[] = [
   {
+    id: "gpt-image-2-6/economy-text-to-image",
+    kind: "image",
+    aliases: [
+      "gpt-image-2.6/economy-text-to-image",
+      "gpt-image-2-6-economy",
+      "gpt-image-2.6-economy",
+      "gpt-image-2-6-economy-text-to-image",
+      "economy",
+    ],
+    provider: "kie",
+    description:
+      "GPT Image 2.6 Economy — same family as Flare but per-image pricing. Best value for budget workflows.",
+    creditsPerUnit: "5 credits/image (≈ $0.025)",
+    isDefault: true,
+  },
+  {
     id: "gpt-image-2-6/flare-text-to-image",
     kind: "image",
-    aliases: ["gpt-image-2.6/flare-text-to-image", "gpt-image-2-6", "gpt-image-2.6"],
+    aliases: [
+      "gpt-image-2.6/flare-text-to-image",
+      "gpt-image-2-6",
+      "gpt-image-2.6",
+      "flare",
+    ],
     provider: "kie",
-    description: "High-resolution social media image generator optimized for posts, thumbnails, and ad banners.",
+    description:
+      "GPT Image 2.6 Flare — premium quality, token-based pricing (~30-36 credits/image). Better for high-end editorial / advertising work.",
+    creditsPerUnit: "36 credits / 1M output tokens (≈ $0.18/1M)",
   },
   {
     id: "grok-imagine-video-1-5-preview",
     kind: "video",
-    aliases: ["grok-imagine-video-1.5-preview", "grok-imagine-video-1-5", "grok-imagine-video-1.5", "grok-imagine"],
+    aliases: [
+      "grok-imagine-video-1.5-preview",
+      "grok-imagine-video-1-5",
+      "grok-imagine-video-1.5",
+      "grok-imagine",
+    ],
     provider: "kie",
     description: "AI video generator with native audio for Reels, TikToks, and Shorts.",
+    creditsPerUnit: "2.4 credits/second (≈ $0.012)",
+    isDefault: true,
   },
 ];
 
@@ -50,9 +90,12 @@ export function resolveModel(input: string): ModelSpec | null {
 }
 
 export function defaultModelForKind(kind: ModelKind): ModelSpec {
-  const m = MODELS.find((x) => x.kind === kind);
-  if (!m) throw new Error(`No model registered for kind ${kind}`);
-  return m;
+  // Prefer the model flagged isDefault; fall back to first of that kind.
+  const def = MODELS.find((x) => x.kind === kind && x.isDefault);
+  if (def) return def;
+  const any = MODELS.find((x) => x.kind === kind);
+  if (!any) throw new Error(`No model registered for kind ${kind}`);
+  return any;
 }
 
 /**
