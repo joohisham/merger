@@ -4,26 +4,28 @@ import { presetForPlatform } from "../models";
 /**
  * kie.ai provider integration.
  *
- * Docs (public):
- *  - Image: POST https://api.kie.ai/api/v1/...  (gpt-image-2-6/flare-text-to-image)
- *  - Video: POST https://api.kie.ai/api/v1/...  (grok-imagine-video-1-5-preview)
+ * Docs (public): https://docs.kie.ai
+ *  - Create task:  POST /api/v1/jobs/createTask
+ *      body: { model, callBackUrl?, input: { prompt, aspect_ratio, ... } }
+ *      resp: { code:200, msg:"success", data: { taskId } }
+ *  - Poll task:    GET  /api/v1/jobs/recordInfo?taskId=<id>
+ *      resp: { code:200, data: { taskId, state: "waiting|queuing|generating|success|fail",
+ *                               progress, resultJson: '{"resultUrls":[...]}' } }
  *
- * kie.ai uses an `apiKey` field inside the request body OR `Authorization: Bearer <key>`
- * (we use the Bearer header). Generation is asynchronous: the create call returns a
- * `data.id` (provider task id) that we poll via the status endpoint.
+ * The same /createTask + /recordInfo pair works for both image and video models.
+ * Auth is via `Authorization: Bearer <api_key>` header.
  */
 
 const KIE_BASE = process.env.KIE_BASE_URL || "https://api.kie.ai";
-const KIE_API_BASE = `${KIE_BASE}/api/v1`;
 
 interface ImageGenInput {
   prompt: string;
   model: string;
   social_platform?: string;
-  aspect_ratio?: string;     // "9:16"
+  aspect_ratio?: string;
   width?: number;
   height?: number;
-  n?: number;                // count
+  n?: number;
 }
 
 interface VideoGenInput {
@@ -31,7 +33,7 @@ interface VideoGenInput {
   model: string;
   social_platform?: string;
   aspect_ratio?: string;
-  duration?: number;          // seconds
+  duration?: number;
 }
 
 export interface ProviderCallOptions {
@@ -39,27 +41,17 @@ export interface ProviderCallOptions {
   video?: VideoGenInput;
 }
 
-function resolveDimensions(input: { social_platform?: string; aspect_ratio?: string; width?: number; height?: number }) {
+function resolveAspectRatio(input: { social_platform?: string; aspect_ratio?: string }): string {
+  if (input.aspect_ratio) return input.aspect_ratio;
   const preset = presetForPlatform(input.social_platform);
-  const ratio = input.aspect_ratio || preset?.ratio;
-  let width = input.width || preset?.width || 1024;
-  let height = input.height || preset?.height || 1024;
-  if (ratio && !input.width && !input.height) {
-    const [w, h] = ratio.split(":").map((x) => parseInt(x, 10));
-    if (w && h) {
-      const base = 1024;
-      width = Math.round((base * w) / Math.max(w, h));
-      height = Math.round((base * h) / Math.max(w, h));
-    }
-  }
-  return { width, height, ratio };
+  return preset?.ratio || "1:1";
 }
 
 async function parseError(res: Response): Promise<{ status: number; message: string }> {
   let message = `HTTP ${res.status}`;
   try {
     const body = await res.json();
-    message = body?.message || body?.error || body?.msg || JSON.stringify(body).slice(0, 300);
+    message = body?.msg || body?.message || body?.error || JSON.stringify(body).slice(0, 300);
   } catch {
     try {
       const text = await res.text();
@@ -69,22 +61,17 @@ async function parseError(res: Response): Promise<{ status: number; message: str
   return { status: res.status, message };
 }
 
-/** Submit an image generation task to kie.ai. */
-export async function kieGenerateImage(
+/** Create a kie.ai task (image or video — both go through the same /createTask). */
+async function kieCreateTask(
   key: ApiKeyRow,
-  opts: ImageGenInput
+  model: string,
+  input: Record<string, unknown>
 ): Promise<ProviderCallResult> {
-  const { width, height, ratio } = resolveDimensions(opts);
-  const endpoint = `${KIE_API_BASE}/images/generations`;
+  const endpoint = `${KIE_BASE}/api/v1/jobs/createTask`;
   const body = {
-    model: opts.model,
-    prompt: opts.prompt,
-    n: opts.n ?? 1,
-    size: `${width}x${height}`,
-    aspectRatio: ratio,
-    response_format: "url",
+    model,
+    input,
   };
-
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -102,60 +89,15 @@ export async function kieGenerateImage(
   }
 
   const data = await res.json();
-  const urls: string[] = Array.isArray(data?.data)
-    ? data.data.map((d: { url?: string; b64_json?: string }) => d.url || (d.b64_json ? `data:image/png;base64,${d.b64_json}` : "")).filter(Boolean)
-    : data?.url
-      ? [data.url]
-      : [];
-
-  const providerTaskId = data?.id || data?.task_id || data?.taskId || null;
-
-  return {
-    keyId: key.id,
-    provider: "kie",
-    providerTaskId: providerTaskId ? String(providerTaskId) : undefined,
-    resultUrls: urls.length > 0 ? urls : undefined,
-    immediate: urls.length > 0,
-    raw: data,
-  };
-}
-
-/** Submit a video generation task to kie.ai. Async — returns a provider task id. */
-export async function kieGenerateVideo(
-  key: ApiKeyRow,
-  opts: VideoGenInput
-): Promise<ProviderCallResult> {
-  const { width, height, ratio } = resolveDimensions(opts);
-  const endpoint = `${KIE_API_BASE}/videos/generations`;
-  const body = {
-    model: opts.model,
-    prompt: opts.prompt,
-    aspectRatio: ratio,
-    width,
-    height,
-    duration: opts.duration ?? 5,
-    audio: true,
-  };
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key.api_key}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const { status, message } = await parseError(res);
-    const err = new Error(message) as Error & { status?: number };
-    err.status = status;
+  // kie.ai wraps responses as { code, msg, data }
+  if (data?.code && data.code !== 200) {
+    const err = new Error(data.msg || `kie.ai code ${data.code}`) as Error & { status?: number };
+    // Map kie-specific codes to HTTP-ish status for our classifier
+    err.status = data.code === 401 ? 401 : data.code === 422 ? 422 : 502;
     throw err;
   }
-
-  const data = await res.json();
-  const providerTaskId = data?.id || data?.task_id || data?.taskId || data?.data?.id;
-  if (!providerTaskId) {
+  const taskId = data?.data?.taskId || data?.data?.id;
+  if (!taskId) {
     const err = new Error("kie.ai did not return a task id") as Error & { status?: number };
     err.status = 502;
     throw err;
@@ -164,24 +106,24 @@ export async function kieGenerateVideo(
   return {
     keyId: key.id,
     provider: "kie",
-    providerTaskId: String(providerTaskId),
+    providerTaskId: String(taskId),
     resultUrls: undefined,
     immediate: false,
     raw: data,
   };
 }
 
-/** Poll a kie.ai task until completion (or timeout). Returns result URLs. */
+/** Poll a kie.ai task until completion. */
 export async function kiePollTask(
-  key: ApiKeyRow,
+  _key: ApiKeyRow,
   providerTaskId: string,
-  kind: "image" | "video"
+  _kind: "image" | "video"
 ): Promise<{ status: string; progress: number; urls: string[]; raw: unknown }> {
-  const endpoint = `${KIE_API_BASE}/${kind === "image" ? "images" : "videos"}/generations/${encodeURIComponent(providerTaskId)}`;
-  const res = await fetch(endpoint, {
+  const url = `${KIE_BASE}/api/v1/jobs/recordInfo?taskId=${encodeURIComponent(providerTaskId)}`;
+  const res = await fetch(url, {
     method: "GET",
     headers: {
-      Authorization: `Bearer ${key.api_key}`,
+      Authorization: `Bearer ${_key.api_key}`,
     },
   });
   if (!res.ok) {
@@ -191,26 +133,70 @@ export async function kiePollTask(
     throw err;
   }
   const data = await res.json();
-  const status = String(data?.status || data?.data?.status || "processing").toLowerCase();
-  const progress = Number(data?.progress || data?.data?.progress || (status === "completed" ? 100 : status === "failed" ? 0 : 10));
+  if (data?.code && data.code !== 200) {
+    const err = new Error(data.msg || `kie.ai code ${data.code}`) as Error & { status?: number };
+    err.status = data.code === 401 ? 401 : data.code === 422 ? 422 : 502;
+    throw err;
+  }
+  const d = data?.data || {};
+  const state = String(d.state || d.status || "generating").toLowerCase();
+  const progress = Number(d.progress ?? (state === "success" ? 100 : state === "fail" ? 0 : 10));
+
+  // Result URLs come back as a JSON string in `resultJson`
   let urls: string[] = [];
-  const out = data?.output || data?.data?.output || data?.url || data?.video_url || data?.data?.url;
-  if (Array.isArray(out)) urls = out.filter(Boolean) as string[];
-  else if (typeof out === "string") urls = [out];
-  else if (out && typeof out === "object" && out.url) urls = [String(out.url)];
+  const rj = d.resultJson;
+  if (typeof rj === "string" && rj.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(rj);
+      const list = parsed?.resultUrls || parsed?.result_urls || parsed?.urls || parsed?.outputs;
+      if (Array.isArray(list)) urls = list.filter(Boolean) as string[];
+      else if (typeof list === "string") urls = [list];
+      else if (parsed?.url) urls = [String(parsed.url)];
+    } catch { /* ignore */ }
+  } else if (Array.isArray(rj)) {
+    urls = rj.filter(Boolean) as string[];
+  } else if (rj && typeof rj === "object") {
+    const list = (rj as { resultUrls?: unknown; result_urls?: unknown; urls?: unknown }).resultUrls
+      || (rj as { result_urls?: unknown }).result_urls
+      || (rj as { urls?: unknown }).urls;
+    if (Array.isArray(list)) urls = list.filter(Boolean) as string[];
+  }
+
+  const status =
+    state === "success" || state === "completed" ? "completed" :
+    state === "fail" || state === "failed" ? "failed" : "processing";
+
   return { status, progress, urls, raw: data };
 }
 
 /** Build a failover call closure for image generation. */
 export function buildImageCall(opts: ImageGenInput) {
   return async ({ key }: { key: ApiKeyRow; provider: ProviderName }): Promise<ProviderCallResult> => {
-    return kieGenerateImage(key, opts);
+    const aspectRatio = resolveAspectRatio(opts);
+    const input: Record<string, unknown> = {
+      prompt: opts.prompt,
+      aspect_ratio: aspectRatio,
+      n: opts.n ?? 1,
+      output_format: "png",
+    };
+    if (opts.width && opts.height) {
+      input.width = opts.width;
+      input.height = opts.height;
+    }
+    return kieCreateTask(key, opts.model, input);
   };
 }
 
 /** Build a failover call closure for video generation. */
 export function buildVideoCall(opts: VideoGenInput) {
   return async ({ key }: { key: ApiKeyRow; provider: ProviderName }): Promise<ProviderCallResult> => {
-    return kieGenerateVideo(key, opts);
+    const aspectRatio = resolveAspectRatio(opts);
+    const input: Record<string, unknown> = {
+      prompt: opts.prompt,
+      aspect_ratio: aspectRatio,
+      duration: opts.duration ?? 5,
+      audio: true,
+    };
+    return kieCreateTask(key, opts.model, input);
   };
 }

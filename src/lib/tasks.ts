@@ -174,15 +174,18 @@ export async function createImageTask(p: ImageGenParams): Promise<{ taskId: stri
 
   if (outcome.success && outcome.result) {
     const r = outcome.result;
+    // kie.ai tasks are always async (POST /createTask -> poll /recordInfo).
+    // If the provider returned immediate resultUrls, mark complete now.
+    const isImmediate = !!r.immediate && !!r.resultUrls?.length;
     await updateTask(id, {
       provider: r.provider,
       provider_task_id: r.providerTaskId ?? null,
       key_id: r.keyId,
       attempts_json: JSON.stringify(outcome.attempts),
-      status: r.immediate && r.resultUrls?.length ? "completed" : "processing",
-      progress: r.immediate && r.resultUrls?.length ? 100 : 10,
+      status: isImmediate ? "completed" : "processing",
+      progress: isImmediate ? 100 : 10,
       result_urls_json: r.resultUrls?.length ? JSON.stringify(r.resultUrls) : null,
-      completed_at: r.immediate && r.resultUrls?.length ? new Date().toISOString() : null,
+      completed_at: isImmediate ? new Date().toISOString() : null,
     });
   } else if (outcome.errorClass === "params") {
     await updateTask(id, {
