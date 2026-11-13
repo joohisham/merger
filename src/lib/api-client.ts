@@ -28,6 +28,7 @@ export interface HealthState {
   database: string;
   merger: boolean;
   keys: number;
+  auth: boolean;
   timestamp: string;
 }
 

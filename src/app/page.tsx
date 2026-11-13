@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import {
   Activity,
   KeyRound,
@@ -25,6 +26,8 @@ import {
   Server,
   Database,
   ShieldCheck,
+  LogOut,
+  Lock,
 } from "lucide-react";
 import {
   Card,
@@ -144,6 +147,47 @@ function useCopy() {
   return { copied, copy };
 }
 
+/* --------------------------- Auth Button -------------------------------- */
+
+function AuthButton() {
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const router = useRouter();
+
+  useEffect(() => {
+    api
+      .health()
+      .then((h) => setAuthEnabled(!!h.auth))
+      .catch(() => {});
+  }, []);
+
+  async function logout() {
+    setLoggingOut(true);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+      router.push("/login");
+      router.refresh();
+    } finally {
+      setLoggingOut(false);
+    }
+  }
+
+  if (!authEnabled) return null;
+
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={logout}
+      disabled={loggingOut}
+      className="gap-1.5 text-muted-foreground hover:text-foreground"
+    >
+      {loggingOut ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
+      <span className="hidden sm:inline">خروج</span>
+    </Button>
+  );
+}
+
 /* ----------------------------- Header ----------------------------------- */
 
 function Header() {
@@ -159,19 +203,22 @@ function Header() {
             <p className="text-xs text-muted-foreground">MCP Media Generator & Social Automation</p>
           </div>
         </div>
-        <div className="hidden items-center gap-2 sm:flex">
-          <Badge variant="outline" className="gap-1 border-emerald-500/30 text-emerald-300">
-            <ShieldCheck className="h-3 w-3" />
-            MCP v1
-          </Badge>
-          <Badge variant="outline" className="gap-1">
-            <Database className="h-3 w-3" />
-            Turso
-          </Badge>
-          <Badge variant="outline" className="gap-1">
-            <Server className="h-3 w-3" />
-            kie.ai
-          </Badge>
+        <div className="flex items-center gap-2">
+          <div className="hidden items-center gap-2 sm:flex">
+            <Badge variant="outline" className="gap-1 border-emerald-500/30 text-emerald-300">
+              <ShieldCheck className="h-3 w-3" />
+              MCP v1
+            </Badge>
+            <Badge variant="outline" className="gap-1">
+              <Database className="h-3 w-3" />
+              Turso
+            </Badge>
+            <Badge variant="outline" className="gap-1">
+              <Server className="h-3 w-3" />
+              kie.ai
+            </Badge>
+          </div>
+          <AuthButton />
         </div>
       </div>
     </header>
@@ -195,6 +242,7 @@ function HealthCard() {
         database: "unreachable",
         merger: false,
         keys: 0,
+        auth: false,
         timestamp: new Date().toISOString(),
       });
     } finally {
@@ -223,7 +271,7 @@ function HealthCard() {
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
         </Button>
       </CardHeader>
-      <CardContent className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <CardContent className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <StatusTile
           title="قاعدة Turso"
           value={tursoOk ? "متصل" : "غير متصل"}
@@ -241,6 +289,12 @@ function HealthCard() {
           value={String(health?.keys ?? 0)}
           ok={(health?.keys ?? 0) > 0}
           icon={<KeyRound className="h-4 w-4" />}
+        />
+        <StatusTile
+          title="الحماية"
+          value={health?.auth ? "مفعّلة" : "معطّلة"}
+          ok={!!health?.auth}
+          icon={<ShieldCheck className="h-4 w-4" />}
         />
         <StatusTile
           title="النظام"
@@ -1038,17 +1092,29 @@ function GenerationStudio() {
 function MCPIntegrationHub() {
   // Use lazy initializer for browser-only API; server renders "" then client hydrates.
   const [origin, setOrigin] = useState("");
+  const [authEnabled, setAuthEnabled] = useState(false);
   const { copied, copy } = useCopy();
 
   useEffect(() => {
-    // Reading window.location is a browser-only side effect; wrap in guard.
+    // Reading window.location + health is browser-only; wrap in guard.
     if (typeof window !== "undefined") {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setOrigin(window.location.origin);
+      api
+        .health()
+        .then((h) => setAuthEnabled(!!h.auth))
+        .catch(() => {});
     }
   }, []);
 
   const mcpUrl = origin ? `${origin}/mcp` : "/mcp";
+  // When SITE_PASSWORD is set, MCP clients must send the password via header.
+  const authHeaders = authEnabled
+    ? { headers: { "x-site-password": "<YOUR_SITE_PASSWORD>" } }
+    : {};
+  const authNote = authEnabled
+    ? "تنبيه: الحماية بكلمة السر مفعّلة. استبدل <YOUR_SITE_PASSWORD> بقيمة SITE_PASSWORD."
+    : "";
 
   const snippets: Array<{ id: string; label: string; desc: string; code: string }> = [
     {
@@ -1061,6 +1127,7 @@ function MCPIntegrationHub() {
             "social-media": {
               url: mcpUrl,
               transport: "http",
+              ...authHeaders,
             },
           },
         },
@@ -1079,6 +1146,7 @@ function MCPIntegrationHub() {
               transport: {
                 type: "http",
                 url: mcpUrl,
+                ...authHeaders,
               },
             },
           },
@@ -1096,6 +1164,7 @@ function MCPIntegrationHub() {
           mcpServers: {
             "social-media": {
               url: mcpUrl,
+              ...authHeaders,
             },
           },
         },
@@ -1107,7 +1176,11 @@ function MCPIntegrationHub() {
       id: "chatgpt",
       label: "ChatGPT Connectors",
       desc: "أضف رابط /mcp كـ Custom Connector في ChatGPT.",
-      code: `# ChatGPT Custom Connector\nEndpoint: ${mcpUrl}\nMethod: POST\nContent-Type: application/json\nAccept: application/json, text/event-stream`,
+      code:
+        `# ChatGPT Custom Connector\nEndpoint: ${mcpUrl}\nMethod: POST\nContent-Type: application/json\nAccept: application/json, text/event-stream` +
+        (authEnabled
+          ? `\nx-site-password: <YOUR_SITE_PASSWORD>`
+          : ""),
     },
   ];
 
@@ -1123,6 +1196,12 @@ function MCPIntegrationHub() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {authEnabled && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+            <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+            <span dir="auto">{authNote}</span>
+          </div>
+        )}
         <div className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/30 p-2">
           <code className="flex-1 truncate font-mono text-xs" dir="ltr">{mcpUrl}</code>
           <Button size="sm" variant="outline" onClick={() => copy(mcpUrl, "url")}>

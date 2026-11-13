@@ -76,6 +76,29 @@ export async function ensureSchema(): Promise<void> {
   for (const stmt of SCHEMA_STATEMENTS) {
     await client.execute(stmt);
   }
+  // Auto-seed the kie.ai key from the KIE_API_KEY env var if it's set and not
+  // already in the DB. This lets Vercel deployments "self-heal" on first cold
+  // start without needing to run the seed script manually.
+  const kieKey = process.env.KIE_API_KEY;
+  if (kieKey) {
+    try {
+      const existing = await client.execute({
+        sql: `SELECT id FROM api_keys WHERE provider = 'kie' AND api_key = ? LIMIT 1`,
+        args: [kieKey],
+      });
+      if (existing.rows.length === 0) {
+        const id = `key_seed_${Date.now().toString(36)}`;
+        await client.execute({
+          sql: `INSERT INTO api_keys (id, provider, label, api_key, status, created_at)
+               VALUES (?, 'kie', 'Auto-seeded from KIE_API_KEY env', ?, 'active', datetime('now'))`,
+          args: [id, kieKey],
+        });
+        console.log(`[turso] Auto-seeded kie.ai key from KIE_API_KEY env as ${id}`);
+      }
+    } catch (e) {
+      console.error("[turso] auto-seed failed:", e);
+    }
+  }
   _schemaEnsured = true;
 }
 

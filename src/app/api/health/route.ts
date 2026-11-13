@@ -25,6 +25,7 @@ export async function GET() {
     database: tursoOk ? "turso-connected" : "turso-error",
     merger: mergerOk,
     keys,
+    auth: !!process.env.SITE_PASSWORD,
     timestamp: new Date().toISOString(),
   });
 }
