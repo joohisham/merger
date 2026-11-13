@@ -243,6 +243,8 @@ function HealthCard() {
         merger: false,
         keys: 0,
         auth: false,
+        env: undefined,
+        error: "تعذّر الوصول إلى الخادم (network error). تحقق من أن التطبيق يعمل.",
         timestamp: new Date().toISOString(),
       });
     } finally {
@@ -303,7 +305,57 @@ function HealthCard() {
           icon={<Activity className="h-4 w-4" />}
         />
       </CardContent>
+      {!health?.ok && (
+        <CardContent className="pt-0">
+          <div className="rounded-md border border-rose-500/30 bg-rose-500/5 p-3 text-xs">
+            <div className="mb-2 flex items-center gap-1.5 font-semibold text-rose-300">
+              <AlertCircle className="h-3.5 w-3.5" />
+              المشكلة: {health?.database === "turso-misconfigured"
+                ? "إعدادات قاعدة البيانات ناقصة"
+                : health?.database === "unreachable"
+                ? "الخادم غير متاح"
+                : "خطأ في الاتصال بقاعدة Turso"}
+            </div>
+            {health?.error && (
+              <p className="mb-2 text-muted-foreground" dir="auto">{health.error}</p>
+            )}
+            {health?.env && (
+              <div className="space-y-1">
+                <p className="text-muted-foreground">متغيرات البيئة (وجود فقط، بدون قيم):</p>
+                <div className="flex flex-wrap gap-1.5">
+                  <EnvBadge label="TURSO_DATABASE_URL" set={health.env.tursoUrlSet} />
+                  <EnvBadge label="TURSO_AUTH_TOKEN" set={health.env.tursoTokenSet} />
+                  <EnvBadge label="KIE_API_KEY" set={health.env.kieKeySet} />
+                  <EnvBadge label="SITE_PASSWORD" set={health.env.sitePasswordSet} />
+                </div>
+                {(!health.env.tursoUrlSet || !health.env.tursoTokenSet) && (
+                  <p className="mt-2 text-amber-300">
+                    تنبيه: متغيرات Turso ناقصة. أضفها في Vercel → Settings → Environment Variables.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </CardContent>
+      )}
     </Card>
+  );
+}
+
+function EnvBadge({ label, set }: { label: string; set: boolean }) {
+  return (
+    <Badge
+      variant="outline"
+      className={`gap-1 font-mono text-xs ${
+        set
+          ? "border-emerald-500/30 text-emerald-300"
+          : "border-rose-500/30 text-rose-300"
+      }`}
+      dir="ltr"
+    >
+      {set ? <Check className="h-3 w-3" /> : <AlertCircle className="h-3 w-3" />}
+      {label}
+    </Badge>
   );
 }
 

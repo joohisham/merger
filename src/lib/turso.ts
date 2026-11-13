@@ -19,21 +19,30 @@ const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN || process.env.TURSO_DB_TOKEN |
 
 if (!TURSO_URL) {
   // We do not throw at import time so the health check can surface the misconfiguration.
-  console.warn("[turso] TURSO_DATABASE_URL is not set. DB features will be unavailable.");
+  console.error("[turso] TURSO_DATABASE_URL is NOT SET. DB features will be unavailable. Set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN in your Vercel env vars.");
 }
 
 let _client: Client | null = null;
 
 export function getDb(): Client {
   if (_client) return _client;
+  // If TURSO_URL is not set, we still create a client (it will fail on first
+  // query, which is caught by the health/debug endpoints and reported clearly).
+  // We do NOT fall back to in-memory SQLite — that would mask the misconfiguration
+  // and make the dashboard show "turso-connected" + "keys: 0" which is confusing.
   _client = createClient({
-    url: TURSO_URL || "file::memory:?cache=shared",
+    url: TURSO_URL,
     authToken: TURSO_TOKEN || undefined,
   });
   return _client;
 }
 
 export const db = getDb();
+
+/** Returns whether the Turso URL + token env vars are configured. */
+export function isTursoConfigured(): boolean {
+  return !!TURSO_URL && !!TURSO_TOKEN;
+}
 
 /**
  * Canonical schema for both tables. Each column is described as
@@ -190,14 +199,22 @@ async function migrateTable(
 }
 
 let _schemaEnsured = false;
+let _ensureSchemaError: string | null = null;
 
 export async function ensureSchema(): Promise<void> {
   if (_schemaEnsured) return;
   const client = getDb();
 
   // Step 1: Create tables (if not exist) + indexes.
-  for (const stmt of SCHEMA_STATEMENTS) {
-    await client.execute(stmt);
+  // Wrap in try/catch so a broken connection doesn't crash the caller.
+  try {
+    for (const stmt of SCHEMA_STATEMENTS) {
+      await client.execute(stmt);
+    }
+  } catch (e) {
+    _ensureSchemaError = (e as Error).message?.slice(0, 300) || "SCHEMA_STATEMENTS failed";
+    console.error("[turso] schema creation failed:", e);
+    throw e; // Re-throw so callers can catch and report; health endpoint wraps this.
   }
 
   // Step 2: Run ALTER TABLE migrations to add any missing columns to tables
@@ -235,6 +252,11 @@ export async function ensureSchema(): Promise<void> {
     }
   }
   _schemaEnsured = true;
+}
+
+/** Returns the last error from ensureSchema(), if any. For diagnostics. */
+export function getEnsureSchemaError(): string | null {
+  return _ensureSchemaError;
 }
 
 export async function pingTurso(): Promise<boolean> {

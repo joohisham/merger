@@ -29,6 +29,13 @@ export interface HealthState {
   merger: boolean;
   keys: number;
   auth: boolean;
+  env?: {
+    tursoUrlSet: boolean;
+    tursoTokenSet: boolean;
+    kieKeySet: boolean;
+    sitePasswordSet: boolean;
+  };
+  error?: string | null;
   timestamp: string;
 }
 

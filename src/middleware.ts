@@ -66,8 +66,10 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // Auth API endpoints are always reachable (they implement the login flow).
-  if (path === "/api/auth/login" || path === "/api/auth/logout") {
+  // Auth API endpoints + debug endpoint are always reachable.
+  // /api/debug only exposes env var PRESENCE (booleans, no values) so it's safe
+  // to expose without auth for troubleshooting config issues.
+  if (path === "/api/auth/login" || path === "/api/auth/logout" || path === "/api/debug") {
     return NextResponse.next();
   }
 
